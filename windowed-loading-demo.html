@@ -1,0 +1,922 @@
+<title>Windowed Loading — how the sliding cache works</title>
+<style>
+  /* Design: a single light "engineering inspection sheet" world — bright,
+     paper-like page chrome around a realistic light-iOS phone mockup, so the
+     todo list inside the phone reads as an actual (light-mode) iOS screen
+     rather than a dark hacker console. Palette:
+       --bg / --panel / --panel-2   warm-neutral off-white surfaces
+       --accent   deep teal   = resident/loaded page
+       --amber    ochre       = in-flight fetch (shimmer)
+       --evict    deep coral  = eviction flash
+       --window   indigo      = "this page is inside the resident window" ring
+     Type: ui-monospace for anything index/byte/log-like (the subject IS indices
+     and offsets), system-ui for prose. No webfonts — CSP blocks font CDNs, and
+     the system stacks are authentic to a dev-tool aesthetic anyway. */
+
+  @font-face {
+    font-family: "SysMono";
+    src: local("SF Mono"), local("Menlo");
+  }
+
+  :root {
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --panel-2: #eef0f3;
+    --line: #dde1e7;
+    --line-soft: #e6e9ee;
+    --text: #1a1e27;
+    --text-dim: #5a6274;
+    --text-faint: #8991a1;
+    --accent: #0e8f7c;
+    --accent-dim: #d7f0eb;
+    --amber: #a8660c;
+    --amber-dim: #faecd6;
+    --evict: #c93c4b;
+    --evict-dim: #fbe1e3;
+    --window: #4453c9;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --radius: 14px;
+
+    /* Phone screen has its own light-iOS palette so it stays convincingly
+       "device UI" even if the page chrome around it changes independently. */
+    --ph-bg: #ffffff;
+    --ph-line: #e2e5ea;
+    --ph-text: #0e1116;
+    --ph-text-dim: #6b7280;
+    --ph-shimmer: #eceef2;
+    --ph-shimmer-hi: #dde0e6;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 20px 64px;
+    gap: 32px;
+  }
+
+  a, button { font-family: inherit; }
+
+  ::selection { background: var(--accent-dim); color: var(--text); }
+
+  /* ---------- header ---------- */
+
+  .masthead {
+    width: 100%;
+    max-width: 1080px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .eyebrow::before {
+    content: "";
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-dim);
+  }
+
+  h1 {
+    font-size: clamp(26px, 3.6vw, 38px);
+    line-height: 1.15;
+    margin: 0;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+
+  h1 code {
+    font-family: var(--mono);
+    font-size: 0.72em;
+    color: var(--window);
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    padding: 0.12em 0.4em;
+    border-radius: 6px;
+    font-weight: 500;
+  }
+
+  .lede {
+    max-width: 62ch;
+    color: var(--text-dim);
+    font-size: 15px;
+    line-height: 1.6;
+    margin: 0;
+  }
+
+  .lede strong { color: var(--text); font-weight: 600; }
+
+  /* ---------- layout ---------- */
+
+  .stage {
+    width: 100%;
+    max-width: 1080px;
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    gap: 28px;
+    align-items: start;
+  }
+
+  @media (max-width: 760px) {
+    .stage { grid-template-columns: 1fr; justify-items: center; }
+  }
+
+  /* ---------- phone ---------- */
+
+  .phone-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .phone {
+    width: 280px;
+    height: 572px;
+    background: linear-gradient(155deg, #eef0f3, #c9cdd4 65%);
+    border-radius: 46px;
+    padding: 12px;
+    box-shadow:
+      0 0 0 1px var(--line),
+      0 30px 60px -28px rgba(20, 24, 32, 0.28),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.6);
+    position: relative;
+  }
+
+  .phone-screen {
+    background: var(--ph-bg);
+    width: 100%;
+    height: 100%;
+    border-radius: 34px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    border: 1px solid #0f1116;
+  }
+
+  .notch {
+    position: absolute;
+    top: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 90px;
+    height: 22px;
+    background: #05070a;
+    border-radius: 14px;
+    z-index: 5;
+  }
+
+  .status-bar {
+    height: 40px;
+    flex: none;
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    padding: 0 20px 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ph-text);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .nav-bar {
+    flex: none;
+    padding: 4px 16px 10px;
+    border-bottom: 1px solid var(--ph-line);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .nav-title {
+    font-size: 17px;
+    font-weight: 650;
+    color: var(--ph-text);
+  }
+
+  .nav-sub {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ph-text-dim);
+    letter-spacing: 0.02em;
+  }
+
+  .list {
+    flex: 1;
+    overflow-y: auto;
+    scrollbar-width: none;
+    cursor: grab;
+    touch-action: pan-y;
+  }
+  .list::-webkit-scrollbar { display: none; }
+  .list.is-dragging {
+    cursor: grabbing;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .row {
+    height: 46px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--ph-line);
+    font-size: 13.5px;
+  }
+
+  .row .dot {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: 1.5px solid var(--ph-text-dim);
+    flex: none;
+  }
+
+  .row .label {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ph-text-dim);
+    font-size: 10px;
+    width: 30px;
+    flex: none;
+  }
+
+  .row .title {
+    flex: 1;
+    color: var(--ph-text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .row.is-loading .title {
+    color: transparent;
+    position: relative;
+    border-radius: 4px;
+    background: linear-gradient(
+      90deg,
+      var(--ph-shimmer) 25%,
+      var(--ph-shimmer-hi) 37%,
+      var(--ph-shimmer) 63%
+    );
+    background-size: 400% 100%;
+    animation: shimmer 1.3s ease-in-out infinite;
+    height: 12px;
+    margin-top: 1px;
+  }
+
+  .row.is-loading .dot {
+    border-color: var(--amber);
+    animation: pulse-ring 1.3s ease-in-out infinite;
+  }
+
+  .row.is-loaded .title { color: var(--ph-text); }
+  .row.is-loaded .dot { border-color: var(--accent); background: var(--accent-dim); }
+
+  @keyframes shimmer {
+    0% { background-position: 100% 0; }
+    100% { background-position: 0 0; }
+  }
+
+  @keyframes pulse-ring {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(168, 102, 12, 0.3); }
+    50% { box-shadow: 0 0 0 4px rgba(168, 102, 12, 0); }
+  }
+
+  .scroll-hint {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .scroll-hint svg { width: 12px; height: 12px; opacity: 0.7; }
+
+  .controls {
+    display: flex;
+    gap: 8px;
+  }
+
+  .btn {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.02em;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 14px;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.05s ease;
+  }
+
+  .btn:hover { background: #e2e5ea; border-color: #c7cdd6; }
+  .btn:active { transform: translateY(1px); }
+  .btn:focus-visible { outline: 2px solid var(--window); outline-offset: 2px; }
+
+  .btn.is-active {
+    color: #f4fbfa;
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+
+  /* ---------- right column ---------- */
+
+  .panel-col {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    min-width: 0;
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 18px 20px;
+  }
+
+  .card h2 {
+    margin: 0 0 4px;
+    font-size: 13px;
+    font-family: var(--mono);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    font-weight: 600;
+  }
+
+  .card .card-note {
+    margin: 0 0 14px;
+    font-size: 12.5px;
+    color: var(--text-faint);
+    line-height: 1.5;
+  }
+
+  /* memory map */
+
+  .pagemap {
+    display: grid;
+    grid-template-columns: repeat(10, 1fr);
+    gap: 6px;
+  }
+
+  .page-cell {
+    aspect-ratio: 1;
+    border-radius: 8px;
+    border: 1.5px solid var(--line);
+    background: var(--panel-2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+    position: relative;
+    transition: background 0.25s ease, border-color 0.25s ease, color 0.25s ease, box-shadow 0.25s ease;
+  }
+
+  .page-cell.is-loading {
+    border-color: var(--amber);
+    color: var(--amber);
+    background: var(--amber-dim);
+    animation: pulse-ring 1.3s ease-in-out infinite;
+  }
+
+  .page-cell.is-resident {
+    border-color: var(--accent);
+    color: #f4fbfa;
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-dim), 0 0 16px -6px var(--accent);
+  }
+
+  .page-cell.is-evicting {
+    border-color: var(--evict);
+    color: var(--evict);
+    background: var(--evict-dim);
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    margin-top: 14px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+
+  .swatch {
+    width: 11px;
+    height: 11px;
+    border-radius: 4px;
+    flex: none;
+    border: 1.5px solid var(--line);
+  }
+
+  .swatch.empty { background: var(--panel-2); border-color: var(--line); }
+  .swatch.loading { background: var(--amber-dim); border-color: var(--amber); }
+  .swatch.resident { background: var(--accent); border-color: var(--accent); }
+  .swatch.evict { background: var(--evict-dim); border-color: var(--evict); }
+
+  /* stats */
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+  }
+
+  .stat {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .stat .num {
+    font-family: var(--mono);
+    font-size: 21px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  .stat .num.accent { color: var(--accent); }
+  .stat .num.evict { color: var(--evict); }
+
+  .stat .lbl {
+    font-size: 10.5px;
+    color: var(--text-faint);
+    letter-spacing: 0.03em;
+  }
+
+  /* log */
+
+  .log {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.9;
+    color: var(--text-dim);
+    height: 168px;
+    overflow-y: scroll;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+  }
+
+  .log::-webkit-scrollbar { width: 6px; }
+  .log::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+
+  .log-entry {
+    display: flex;
+    gap: 8px;
+    padding: 1px 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .log-entry .t {
+    color: var(--text-faint);
+    flex: none;
+  }
+
+  .log-entry.tag-load .msg { color: var(--amber); }
+  .log-entry.tag-ready .msg { color: var(--accent); }
+  .log-entry.tag-evict .msg { color: var(--evict); }
+
+  footer {
+    max-width: 1080px;
+    width: 100%;
+    color: var(--text-faint);
+    font-size: 12px;
+    font-family: var(--mono);
+    border-top: 1px solid var(--line-soft);
+    padding-top: 16px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .row.is-loading .title,
+    .row.is-loading .dot,
+    .page-cell.is-loading {
+      animation: none;
+    }
+  }
+</style>
+
+<div class="masthead">
+  <div class="eyebrow">Windowed loading</div>
+  <h1>A sliding cache, not a growing list — <code>items: [Int: Todo]</code></h1>
+  <p class="lede">
+    Instead of fetching every row up front, the store keeps only a bounded
+    <strong>window</strong> of pages resident in memory. Scroll past the edge of
+    what's loaded and a page fetches in; scroll far enough and the
+    <strong>oldest resident page evicts</strong> back to a placeholder. Scroll the
+    phone below, or press <strong>Auto-scroll</strong> to watch it happen on its own.
+  </p>
+</div>
+
+<div class="stage">
+  <div class="phone-wrap">
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="phone-screen">
+        <div class="status-bar">
+          <span id="clock">9:41</span>
+          <span>••••</span>
+        </div>
+        <div class="nav-bar">
+          <div class="nav-title">Todo</div>
+          <div class="nav-sub" id="nav-sub">totalCount = 300 · pageSize = 30</div>
+        </div>
+        <div class="list" id="list"></div>
+      </div>
+    </div>
+    <div class="scroll-hint">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 5v14M5 12l7 7 7-7" />
+      </svg>
+      drag inside the screen to scroll
+    </div>
+    <div class="controls">
+      <button class="btn is-active" id="autoscroll-btn" type="button">Auto-scroll: on</button>
+      <button class="btn" id="reset-btn" type="button">Reset</button>
+    </div>
+  </div>
+
+  <div class="panel-col">
+    <div class="card">
+      <h2>Resident window</h2>
+      <p class="card-note">
+        One cell per page (30 items each). Bright teal = loaded &amp; currently
+        resident. Amber = fetch in flight. Coral flash = just evicted.
+      </p>
+      <div class="pagemap" id="pagemap"></div>
+      <div class="legend">
+        <div class="legend-item"><span class="swatch empty"></span>not loaded</div>
+        <div class="legend-item"><span class="swatch loading"></span>fetching</div>
+        <div class="legend-item"><span class="swatch resident"></span>resident (max 3 pages)</div>
+        <div class="legend-item"><span class="swatch evict"></span>just evicted</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Live counters</h2>
+      <div class="stats">
+        <div class="stat">
+          <span class="num accent" id="stat-resident">0</span>
+          <span class="lbl">items resident</span>
+        </div>
+        <div class="stat">
+          <span class="num" id="stat-fetches">0</span>
+          <span class="lbl">page fetches</span>
+        </div>
+        <div class="stat">
+          <span class="num evict" id="stat-evictions">0</span>
+          <span class="lbl">evictions</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Event log</h2>
+      <p class="card-note">Newest first — mirrors what <code style="font-family:var(--mono); color:var(--window); background:transparent; border:none; padding:0;">ensureLoaded(index:)</code> does on every row appear.</p>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+</div>
+
+<footer>windowed-loading-demo — sparse index cache, page eviction, and on-scroll fetch, illustrated</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  var TOTAL = 300;
+  var PAGE_SIZE = 30;
+  var PAGE_COUNT = TOTAL / PAGE_SIZE;
+  var MAX_RESIDENT_PAGES = 3;
+  var LOAD_DELAY_MS = 550;
+
+  var rowState = new Array(TOTAL).fill("empty"); // empty | loading | loaded
+  var loadingPages = new Set();
+  var residentPages = new Set(); // pages currently resident in the window
+  var evictingPages = new Set();
+
+  var fetchCount = 0;
+  var evictionCount = 0;
+
+  var listEl = document.getElementById("list");
+  var pagemapEl = document.getElementById("pagemap");
+  var logEl = document.getElementById("log");
+  var statResident = document.getElementById("stat-resident");
+  var statFetches = document.getElementById("stat-fetches");
+  var statEvictions = document.getElementById("stat-evictions");
+  var navSub = document.getElementById("nav-sub");
+  var autoBtn = document.getElementById("autoscroll-btn");
+  var resetBtn = document.getElementById("reset-btn");
+  var clockEl = document.getElementById("clock");
+
+  var titles = [
+    "Buy groceries", "Reply to Sam", "Walk the dog", "Ship release notes",
+    "Water the plants", "Book dentist", "Renew passport", "Call plumber",
+    "Review PR #482", "Pay rent", "Pack for trip", "Fix flaky test",
+    "Read design doc", "Update resume", "Clean garage", "Plan offsite",
+    "Return library books", "Backup laptop", "Sketch roadmap", "Sort receipts"
+  ];
+
+  function titleFor(i) {
+    return titles[i % titles.length] + " #" + (i + 1);
+  }
+
+  // ---- build rows ----
+  var rowEls = new Array(TOTAL);
+  var frag = document.createDocumentFragment();
+  for (var i = 0; i < TOTAL; i++) {
+    var row = document.createElement("div");
+    row.className = "row";
+    row.dataset.index = String(i);
+    row.innerHTML =
+      '<span class="dot"></span>' +
+      '<span class="label">' + i + '</span>' +
+      '<span class="title"></span>';
+    rowEls[i] = row;
+    frag.appendChild(row);
+  }
+  listEl.appendChild(frag);
+
+  // ---- build page map ----
+  var pageEls = new Array(PAGE_COUNT);
+  for (var p = 0; p < PAGE_COUNT; p++) {
+    var cell = document.createElement("div");
+    cell.className = "page-cell";
+    cell.textContent = "P" + p;
+    cell.title = "items " + (p * PAGE_SIZE) + "–" + (p * PAGE_SIZE + PAGE_SIZE - 1);
+    pagemapEl.appendChild(cell);
+    pageEls[p] = cell;
+  }
+
+  function pageIndexFor(i) { return Math.floor(i / PAGE_SIZE); }
+
+  function log(tag, msg) {
+    var entry = document.createElement("div");
+    entry.className = "log-entry tag-" + tag;
+    var now = new Date();
+    var t = String(now.getMinutes()).padStart(2, "0") + ":" + String(now.getSeconds()).padStart(2, "0");
+    entry.innerHTML = '<span class="t">' + t + "</span><span class=\"msg\">" + msg + "</span>";
+    logEl.insertBefore(entry, logEl.firstChild);
+    while (logEl.children.length > 60) logEl.removeChild(logEl.lastChild);
+  }
+
+  function renderRow(i) {
+    var el = rowEls[i];
+    var state = rowState[i];
+    el.classList.toggle("is-loading", state === "loading");
+    el.classList.toggle("is-loaded", state === "loaded");
+    var titleEl = el.querySelector(".title");
+    titleEl.textContent = state === "loaded" ? titleFor(i) : "";
+  }
+
+  function renderPage(p) {
+    var el = pageEls[p];
+    el.classList.remove("is-loading", "is-resident", "is-evicting");
+    if (evictingPages.has(p)) {
+      el.classList.add("is-evicting");
+    } else if (loadingPages.has(p)) {
+      el.classList.add("is-loading");
+    } else if (residentPages.has(p)) {
+      el.classList.add("is-resident");
+    }
+  }
+
+  function updateStats() {
+    statResident.textContent = String(residentPages.size * PAGE_SIZE);
+    statFetches.textContent = String(fetchCount);
+    statEvictions.textContent = String(evictionCount);
+  }
+
+  function ensureLoaded(i) {
+    if (rowState[i] !== "empty") return;
+    var p = pageIndexFor(i);
+    if (loadingPages.has(p)) return;
+    loadingPages.add(p);
+    fetchCount++;
+
+    var start = p * PAGE_SIZE;
+    var end = Math.min(start + PAGE_SIZE, TOTAL);
+    for (var j = start; j < end; j++) {
+      if (rowState[j] === "empty") {
+        rowState[j] = "loading";
+        renderRow(j);
+      }
+    }
+    renderPage(p);
+    log("load", "fetching page " + p + " (offset " + start + ", limit " + PAGE_SIZE + ")");
+    updateStats();
+
+    setTimeout(function () {
+      loadingPages.delete(p);
+      for (var j = start; j < end; j++) {
+        rowState[j] = "loaded";
+        renderRow(j);
+      }
+      residentPages.add(p);
+      renderPage(p);
+      log("ready", "page " + p + " loaded — window: [" + Array.from(residentPages).sort(function(a,b){return a-b;}).join(", ") + "]");
+
+      if (residentPages.size > MAX_RESIDENT_PAGES) {
+        // Evict whichever *other* resident page is farthest (by page-index distance) from
+        // the page we just loaded — not the least-recently-loaded one. Plain LRU tends to
+        // evict a page sitting right next to where the user currently is, which immediately
+        // reopens a gap right next to the visible window on the next small scroll.
+        var evicted = null;
+        var maxDist = -1;
+        residentPages.forEach(function (candidate) {
+          if (candidate === p) return;
+          var dist = Math.abs(candidate - p);
+          if (dist > maxDist) { maxDist = dist; evicted = candidate; }
+        });
+        residentPages.delete(evicted);
+        var es = evicted * PAGE_SIZE;
+        var ee = Math.min(es + PAGE_SIZE, TOTAL);
+        for (var k = es; k < ee; k++) {
+          rowState[k] = "empty";
+          renderRow(k);
+        }
+        evictionCount++;
+        evictingPages.add(evicted);
+        renderPage(evicted);
+        log("evict", "page " + evicted + " evicted (farthest from " + p + ", cap = " + MAX_RESIDENT_PAGES + " pages)");
+        setTimeout(function (pg) {
+          return function () {
+            evictingPages.delete(pg);
+            renderPage(pg);
+          };
+        }(evicted), 700);
+      }
+      updateStats();
+    }, LOAD_DELAY_MS);
+  }
+
+  // ---- visibility-driven loading (mirrors SwiftUI .onAppear) ----
+  var io = new IntersectionObserver(
+    function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          ensureLoaded(Number(entry.target.dataset.index));
+        }
+      });
+    },
+    { root: listEl, rootMargin: "80px 0px", threshold: 0.01 }
+  );
+  rowEls.forEach(function (el) { io.observe(el); });
+
+  // ---- auto-scroll demo ----
+  var autoScrolling = true;
+  var rafId = null;
+  var direction = 1;
+  var lastTs = null;
+  var SPEED = 34; // px/sec
+
+  function tick(ts) {
+    if (!autoScrolling) { rafId = null; return; }
+    if (lastTs == null) lastTs = ts;
+    var dt = (ts - lastTs) / 1000;
+    lastTs = ts;
+    var max = listEl.scrollHeight - listEl.clientHeight;
+    var next = listEl.scrollTop + direction * SPEED * dt;
+    if (next >= max) { next = max; direction = -1; }
+    if (next <= 0) { next = 0; direction = 1; }
+    listEl.scrollTop = next;
+    rafId = requestAnimationFrame(tick);
+  }
+
+  function setAutoScroll(on) {
+    autoScrolling = on;
+    autoBtn.textContent = "Auto-scroll: " + (on ? "on" : "off");
+    autoBtn.classList.toggle("is-active", on);
+    if (on) {
+      lastTs = null;
+      if (!rafId) rafId = requestAnimationFrame(tick);
+    } else if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+  }
+
+  autoBtn.addEventListener("click", function () { setAutoScroll(!autoScrolling); });
+
+  // manual scroll/drag pauses autoplay
+  ["wheel", "touchstart"].forEach(function (evt) {
+    listEl.addEventListener(evt, function () { if (autoScrolling) setAutoScroll(false); }, { passive: true });
+  });
+
+  // ---- click-and-drag to scroll (mouse, not just touch/wheel) ----
+  var isDragging = false;
+  var dragStartY = 0;
+  var dragStartScrollTop = 0;
+  var dragMoved = false;
+
+  listEl.addEventListener("pointerdown", function (e) {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    isDragging = true;
+    dragMoved = false;
+    dragStartY = e.clientY;
+    dragStartScrollTop = listEl.scrollTop;
+    listEl.classList.add("is-dragging");
+    listEl.setPointerCapture(e.pointerId);
+    if (autoScrolling) setAutoScroll(false);
+  });
+
+  listEl.addEventListener("pointermove", function (e) {
+    if (!isDragging) return;
+    var dy = e.clientY - dragStartY;
+    if (Math.abs(dy) > 2) dragMoved = true;
+    listEl.scrollTop = dragStartScrollTop - dy;
+  });
+
+  function endDrag(e) {
+    if (!isDragging) return;
+    isDragging = false;
+    listEl.classList.remove("is-dragging");
+    if (e && e.pointerId != null && listEl.hasPointerCapture(e.pointerId)) {
+      listEl.releasePointerCapture(e.pointerId);
+    }
+  }
+
+  listEl.addEventListener("pointerup", endDrag);
+  listEl.addEventListener("pointercancel", endDrag);
+  listEl.addEventListener("pointerleave", function (e) {
+    if (e.pointerType === "mouse") endDrag(e);
+  });
+
+  function reset() {
+    setAutoScroll(false);
+    rowState.fill("empty");
+    loadingPages.clear();
+    residentPages.clear();
+    evictingPages.clear();
+    fetchCount = 0;
+    evictionCount = 0;
+    logEl.innerHTML = "";
+    for (var i = 0; i < TOTAL; i++) renderRow(i);
+    for (var p2 = 0; p2 < PAGE_COUNT; p2++) renderPage(p2);
+    updateStats();
+    listEl.scrollTop = 0;
+    log("ready", "reset — window empty, scroll to begin");
+    setTimeout(function () { setAutoScroll(true); }, 500);
+  }
+
+  resetBtn.addEventListener("click", reset);
+
+  // fake status-bar clock, purely decorative
+  function paintClock() {
+    var d = new Date();
+    var h = d.getHours() % 12 || 12;
+    var m = String(d.getMinutes()).padStart(2, "0");
+    clockEl.textContent = h + ":" + m;
+  }
+  paintClock();
+  setInterval(paintClock, 15000);
+
+  navSub.textContent = "totalCount = " + TOTAL + " · pageSize = " + PAGE_SIZE + " · max " + MAX_RESIDENT_PAGES + " pages resident";
+
+  updateStats();
+  setAutoScroll(true);
+})();
+</script>
