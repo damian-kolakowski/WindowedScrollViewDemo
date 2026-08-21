@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# Xcode per-user state (contains local file paths and your macOS username)
+xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+
+# Build products
+DerivedData/
+build/
+*.ipa
+*.dSYM.zip
+*.dSYM
