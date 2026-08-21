@@ -2,6 +2,8 @@
 
 A SwiftUI todo list backed by SQLite that keeps only a few pages of rows in memory at a time, loading them as you scroll. It demonstrates why a windowed list has to render a fixed `0..<totalCount` range rather than just the rows it happens to have loaded.
 
+[interactive demo](https://damian-kolakowski.github.io/WindowedScrollViewDemo/windowed-loading-demo.html)
+
 ## The problem with rendering only what's loaded
 
 The obvious approach is to back the list with a plain array of the rows currently in memory and iterate it directly:
